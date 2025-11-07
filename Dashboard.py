@@ -20,8 +20,7 @@ st.sidebar.markdown("### 📤 Upload data (optional)")
 ec2_upload = st.sidebar.file_uploader("EC2 CSV (aws_resources_compute.csv)", type=["csv"], key="ec2_up")
 s3_upload  = st.sidebar.file_uploader("S3 CSV (aws_resources_S3.csv)", type=["csv"], key="s3_up")
 
-EC2_PATH = r"C:\Users\kamal\Downloads\Week 9 - EDA\aws_resources_compute.csv"  # local fallback
-S3_PATH  = r"C:\Users\kamal\Downloads\Week 9 - EDA\aws_resources_S3.csv"       # local fallback
+
 
 def _clean_df(df):
     df.columns = df.columns.str.strip()
