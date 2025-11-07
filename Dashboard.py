@@ -14,18 +14,57 @@ st.set_page_config(page_title="EC2 & S3 EDA + ML", layout="wide")
 st.title("🖥️ EC2 & 🪣 S3 Exploratory Data Analysis (EDA + ML)")
 
 # -------------------------------
-# Local file paths (edit if needed)
-# -------------------------------
-EC2_PATH = r"C:\Users\kamal\Downloads\Week 9 - EDA\aws_resources_compute.csv"
-S3_PATH  = r"C:\Users\kamal\Downloads\Week 9 - EDA\aws_resources_S3.csv"
-
-# -------------------------------
-# Upload widgets (cloud-friendly)
+# Uploads (cloud-friendly)
 # -------------------------------
 st.sidebar.markdown("### 📤 Upload data (optional)")
 ec2_upload = st.sidebar.file_uploader("EC2 CSV (aws_resources_compute.csv)", type=["csv"], key="ec2_up")
 s3_upload  = st.sidebar.file_uploader("S3 CSV (aws_resources_S3.csv)", type=["csv"], key="s3_up")
 
+EC2_PATH = r"C:\Users\kamal\Downloads\Week 9 - EDA\aws_resources_compute.csv"  # local fallback
+S3_PATH  = r"C:\Users\kamal\Downloads\Week 9 - EDA\aws_resources_S3.csv"       # local fallback
+
+def _clean_df(df):
+    df.columns = df.columns.str.strip()
+    df = df.loc[:, ~df.columns.duplicated()]
+    if "CreationDate" in df.columns:
+        df["CreationDate"] = pd.to_datetime(df["CreationDate"], errors="coerce")
+    return df
+
+def load_csv_any(local_path, uploaded_file):
+    # 1) Prefer uploaded file
+    if uploaded_file is not None:
+        df = pd.read_csv(uploaded_file, low_memory=False)
+        return _clean_df(df), "uploaded"
+
+    # 2) Fallback to local path (for local dev)
+    if local_path and os.path.exists(local_path):
+        df = pd.read_csv(local_path, low_memory=False)
+        return _clean_df(df), "local"
+
+    # 3) Neither exists
+    return pd.DataFrame(), "missing"
+
+ec2, ec2_src = load_csv_any(EC2_PATH, ec2_upload)
+s3,  s3_src  = load_csv_any(S3_PATH,  s3_upload)
+
+# Friendly notices instead of hard errors
+if ec2_src == "uploaded":
+    st.sidebar.success("Using **uploaded** EC2 CSV")
+elif ec2_src == "local":
+    st.sidebar.info("Using **local** EC2 CSV path")
+else:
+    st.sidebar.warning("No EC2 CSV yet — upload on the left to enable EC2 analysis.")
+
+if s3_src == "uploaded":
+    st.sidebar.success("Using **uploaded** S3 CSV")
+elif s3_src == "local":
+    st.sidebar.info("Using **local** S3 CSV path")
+else:
+    st.sidebar.warning("No S3 CSV yet — upload on the left to enable S3 analysis.")
+
+# Stop only if BOTH are missing (so the UI still renders for at least one file)
+if ec2_src == "missing" and s3_src == "missing":
+    st.stop()
 
 # -------------------------------
 # Load helpers
