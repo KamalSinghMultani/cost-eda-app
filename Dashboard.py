@@ -1,69 +1,57 @@
-# Dashboard.py  — EC2 & S3 EDA + ML
-# (adds a new "🤖 ML" tab to train/predict CostUSD for EC2 and S3)
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
 import os
 
-# NEW: simple ML
+# sklearn imports only used in the ML tab later
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_absolute_error, r2_score
 
 st.set_page_config(page_title="EC2 & S3 EDA + ML", layout="wide")
 st.title("🖥️ EC2 & 🪣 S3 Exploratory Data Analysis (EDA + ML)")
+st.caption("Build: 2025-11-07 • Upload-only mode")
 
-# -------------------------------
-# Uploads (cloud-friendly)
-# -------------------------------
-st.sidebar.markdown("### 📤 Upload data (optional)")
+# ---------- Upload-only loader (no local paths) ----------
+st.sidebar.markdown("### 📤 Upload data (required)")
 ec2_upload = st.sidebar.file_uploader("EC2 CSV (aws_resources_compute.csv)", type=["csv"], key="ec2_up")
 s3_upload  = st.sidebar.file_uploader("S3 CSV (aws_resources_S3.csv)", type=["csv"], key="s3_up")
 
-
-
-def _clean_df(df):
+def _clean_df(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
     df.columns = df.columns.str.strip()
     df = df.loc[:, ~df.columns.duplicated()]
     if "CreationDate" in df.columns:
         df["CreationDate"] = pd.to_datetime(df["CreationDate"], errors="coerce")
     return df
 
-def load_csv_any(local_path, uploaded_file):
-    # 1) Prefer uploaded file
-    if uploaded_file is not None:
+def load_uploaded_csv(uploaded_file):
+    if uploaded_file is None:
+        return pd.DataFrame(), False
+    try:
         df = pd.read_csv(uploaded_file, low_memory=False)
-        return _clean_df(df), "uploaded"
+        return _clean_df(df), True
+    except Exception as e:
+        st.error(f"Failed to read uploaded file: {e}")
+        return pd.DataFrame(), False
 
-    # 2) Fallback to local path (for local dev)
-    if local_path and os.path.exists(local_path):
-        df = pd.read_csv(local_path, low_memory=False)
-        return _clean_df(df), "local"
+ec2, ec2_ok = load_uploaded_csv(ec2_upload)
+s3,  s3_ok  = load_uploaded_csv(s3_upload)
 
-    # 3) Neither exists
-    return pd.DataFrame(), "missing"
-
-ec2, ec2_src = load_csv_any(EC2_PATH, ec2_upload)
-s3,  s3_src  = load_csv_any(S3_PATH,  s3_upload)
-
-# Friendly notices instead of hard errors
-if ec2_src == "uploaded":
+if ec2_ok:
     st.sidebar.success("Using **uploaded** EC2 CSV")
-elif ec2_src == "local":
-    st.sidebar.info("Using **local** EC2 CSV path")
 else:
-    st.sidebar.warning("No EC2 CSV yet — upload on the left to enable EC2 analysis.")
+    st.sidebar.warning("No EC2 CSV uploaded yet.")
 
-if s3_src == "uploaded":
+if s3_ok:
     st.sidebar.success("Using **uploaded** S3 CSV")
-elif s3_src == "local":
-    st.sidebar.info("Using **local** S3 CSV path")
 else:
-    st.sidebar.warning("No S3 CSV yet — upload on the left to enable S3 analysis.")
+    st.sidebar.warning("No S3 CSV uploaded yet.")
 
-# Stop only if BOTH are missing (so the UI still renders for at least one file)
-if ec2_src == "missing" and s3_src == "missing":
+if not ec2_ok and not s3_ok:
+    st.warning("Please upload at least one CSV on the left to proceed.")
     st.stop()
+# ---------- end upload-only loader ----------
 
 # -------------------------------
 # Load helpers
@@ -80,8 +68,6 @@ def load_local_csv(path):
             df[maybe_date] = pd.to_datetime(df[maybe_date], errors="coerce")
     return df
 
-ec2 = load_local_csv(EC2_PATH)
-s3  = load_local_csv(S3_PATH)
 
 # -------------------------------
 # Basic cleaning
