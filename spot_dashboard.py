@@ -1,24 +1,26 @@
-# spot_eda_app.py
+# spot_eda_app.py  — AWS EC2 Spot Pricing EDA (Cheapest Regions, Trends & 7-Day Forecast)
 import os
 from pathlib import Path
+from io import BytesIO
+from zipfile import ZipFile
 
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
-from sklearn.linear_model import LinearRegression  # NEW: simple ML
+from sklearn.linear_model import LinearRegression  # tiny ML forecaster
 
 st.set_page_config(page_title="AWS EC2 Spot Pricing EDA", layout="wide")
 st.title("📉 AWS EC2 Spot Pricing EDA (Cheapest Regions & Trends)")
 
-# ---------------------------------
+# --------------------------------------------------------------------------------------
 # Constants & helpers
-# ---------------------------------
+# --------------------------------------------------------------------------------------
 COLS = ["Timestamp", "InstanceType", "Platform", "AvailabilityZone", "Price"]
 
 
 def _read_csv_flexible(src, *, has_upload_handle: bool) -> pd.DataFrame:
-    """Read a CSV that may or may not have a header row."""
+    """Read a CSV that may or may not have a header row; coerce to COLS."""
     try:
         df0 = pd.read_csv(src, header=0)
         if all(c in df0.columns for c in COLS):
@@ -29,6 +31,7 @@ def _read_csv_flexible(src, *, has_upload_handle: bool) -> pd.DataFrame:
             return df0
         raise ValueError("Header attempt did not match expected columns.")
     except Exception:
+        # Reset uploaded file pointer if needed
         if has_upload_handle and hasattr(src, "seek"):
             try:
                 src.seek(0)
@@ -40,6 +43,7 @@ def _read_csv_flexible(src, *, has_upload_handle: bool) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def load_many_csv_from_folder(folder_path: str) -> pd.DataFrame:
+    """Desktop/local: read every *.csv in a folder, derive Region from filename."""
     dfs = []
     for name in os.listdir(folder_path):
         if name.lower().endswith(".csv"):
@@ -56,13 +60,21 @@ def load_many_csv_from_folder(folder_path: str) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False)
-def load_many_csv_uploaded(files) -> pd.DataFrame:
+def load_many_csv_from_zip(uploaded_zip) -> pd.DataFrame:
+    """Cloud/Upload: read all CSVs inside a .zip; Region from inner file names."""
+    data = uploaded_zip.read()  # bytes
     dfs = []
-    for f in files:
-        region = os.path.splitext(os.path.basename(f.name))[0]
-        df = _read_csv_flexible(f, has_upload_handle=True)
-        df["Region"] = region
-        dfs.append(df)
+    with ZipFile(BytesIO(data)) as zf:
+        for info in zf.infolist():
+            if info.is_dir():
+                continue
+            if not info.filename.lower().endswith(".csv"):
+                continue
+            with zf.open(info) as fh:
+                df = _read_csv_flexible(fh, has_upload_handle=True)
+                region = os.path.splitext(os.path.basename(info.filename))[0]
+                df["Region"] = region
+                dfs.append(df)
     if not dfs:
         return pd.DataFrame(columns=COLS + ["Region"])
     return pd.concat(dfs, ignore_index=True)
@@ -70,17 +82,27 @@ def load_many_csv_uploaded(files) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def prep(df: pd.DataFrame) -> pd.DataFrame:
+    """Light cleaning and normalization."""
     out = df.copy()
+
+    # numeric
     out["Price"] = pd.to_numeric(out["Price"], errors="coerce", downcast="float")
+
+    # datetime (naive OK)
     out["Timestamp"] = pd.to_datetime(out["Timestamp"], errors="coerce", utc=False)
     try:
+        # if tz-aware, drop tz
         if pd.api.types.is_datetime64tz_dtype(out["Timestamp"]):
             out["Timestamp"] = out["Timestamp"].dt.tz_convert(None)
     except Exception:
         pass
+
+    # normalize strings
     for c in ["InstanceType", "Platform", "AvailabilityZone", "Region"]:
         if c in out.columns:
             out[c] = out[c].astype(str).str.strip()
+
+    # essential field present
     out = out.dropna(subset=["Price"])
     return out
 
@@ -105,6 +127,7 @@ def daily_means(df: pd.DataFrame, instance_type: str, platform: str):
 
 
 def slope_per_region(daily_df: pd.DataFrame) -> pd.DataFrame:
+    """Slope of linear fit per region (lower is falling price)."""
     rows = []
     for region in daily_df["Region"].unique():
         r = daily_df[daily_df["Region"] == region].sort_values("Timestamp")
@@ -120,22 +143,16 @@ def slope_per_region(daily_df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows).sort_values("Slope")
 
 
-# --------- NEW: very small ML forecaster (LinearRegression) ----------
 def fit_forecast_linear(df_daily_region: pd.DataFrame, days_ahead: int = 7) -> pd.DataFrame:
-    """
-    df_daily_region: rows for ONE region with columns [Timestamp, Price].
-    Returns a dataframe with historical + predicted rows (column 'Type' = 'History'/'Forecast').
-    """
+    """Simple 7-day forecast per region using LinearRegression."""
     r = df_daily_region.sort_values("Timestamp").copy()
     if len(r) < 3:
         return pd.DataFrame(columns=["Timestamp", "Price", "Type"])
 
-    # Encode dates as ordinal integers
     X = r["Timestamp"].map(pd.Timestamp.toordinal).to_numpy().reshape(-1, 1)
     y = r["Price"].astype(float).to_numpy()
 
-    model = LinearRegression()
-    model.fit(X, y)
+    model = LinearRegression().fit(X, y)
 
     last_date = r["Timestamp"].max().normalize()
     future_dates = pd.date_range(last_date + pd.Timedelta(days=1), periods=days_ahead, freq="D")
@@ -148,47 +165,72 @@ def fit_forecast_linear(df_daily_region: pd.DataFrame, days_ahead: int = 7) -> p
     return pd.concat([hist, fut], ignore_index=True)
 
 
-# ---------------------------------
-# Data input
-# ---------------------------------
+# --------------------------------------------------------------------------------------
+# Data input (Cloud-friendly + optional local folder for desktop)
+# --------------------------------------------------------------------------------------
 st.sidebar.header("📥 Data Input")
 
-# Auto-pick the current user's Downloads\archive for local runs.
-# On Streamlit Cloud this path won't exist, and the uploader will be used.
+use_local_folder = st.sidebar.checkbox("Use local folder (desktop only)", value=False)
+
 default_folder = str(Path.home() / "Downloads" / "archive")
+folder_path = ""
+if use_local_folder:
+    folder_path = st.sidebar.text_input("Folder path with regional CSVs", value=default_folder, key="folder_path")
 
-folder_path = st.sidebar.text_input("Folder path with regional CSVs", value=default_folder, key="folder_path")
-
-uploaded = st.sidebar.file_uploader(
-    "…or upload multiple regional CSVs (filenames like us-east-1.csv)",
-    type=["csv"],
+uploads = st.sidebar.file_uploader(
+    "Upload regional CSVs (multi-select) or a .zip containing CSVs",
+    type=["csv", "zip"],                 # <-- ZIP enabled
     accept_multiple_files=True,
     key="uploader",
 )
 
-if uploaded:
-    raw = load_many_csv_uploaded(uploaded)
-elif folder_path and os.path.isdir(folder_path):
-    raw = load_many_csv_from_folder(folder_path)
+raw = pd.DataFrame(columns=COLS + ["Region"])
+
+if use_local_folder:
+    if folder_path and os.path.isdir(folder_path):
+        raw = load_many_csv_from_folder(folder_path)
+    else:
+        st.warning("Folder path not found on this machine. Either correct it or uncheck 'Use local folder' and upload files.")
 else:
-    st.warning("Provide a valid folder path or upload CSV files.")
+    if uploads:
+        dfs = []
+        for f in uploads:
+            name = f.name.lower()
+            if name.endswith(".zip"):
+                try:
+                    dfs.append(load_many_csv_from_zip(f))
+                except Exception as e:
+                    st.error(f"Failed to read ZIP '{f.name}': {e}")
+            else:  # CSV
+                try:
+                    df = _read_csv_flexible(f, has_upload_handle=True)
+                    region = os.path.splitext(os.path.basename(f.name))[0]
+                    df["Region"] = region
+                    dfs.append(df)
+                except Exception as e:
+                    st.error(f"Failed to read CSV '{f.name}': {e}")
+        if dfs:
+            raw = pd.concat(dfs, ignore_index=True)
+
+if raw.empty:
+    st.warning("Provide a valid local folder (desktop) or upload CSVs/ZIP to continue.")
     st.stop()
 
 data = prep(raw)
-if len(data) == 0:
-    st.warning("No rows loaded. Check CSVs, then try again.")
+if data.empty:
+    st.warning("No rows after cleaning. Check your files and try again.")
     st.stop()
 
 st.caption(f"Loaded **{len(data):,}** rows from **{data['Region'].nunique()}** regions.")
 with st.expander("Preview raw data"):
     st.dataframe(data.head(20), use_container_width=True)
 
+# --------------------------------------------------------------------------------------
 # Tabs
+# --------------------------------------------------------------------------------------
 tab1, tab2, tab3 = st.tabs(["💸 Cheapest Regions", "📈 Trends & Slopes", "🤖 Forecast"])
 
-# ------------------------------
-# TAB 1 — Cheapest Regions
-# ------------------------------
+# ------------------------------ TAB 1 — Cheapest Regions ------------------------------
 with tab1:
     st.subheader("Find Cheapest Region(s) by Instance Type")
     platforms = sorted([p for p in data["Platform"].dropna().unique()])
@@ -215,11 +257,17 @@ with tab1:
             else:
                 st.warning("No rows found for that selection.")
         else:
-            chosen = st.multiselect("Instance types", instances, default=instances[:5] if len(instances) >= 5 else instances, key="itype_cheapest_batch")
+            chosen = st.multiselect(
+                "Instance types",
+                instances,
+                default=instances[:5] if len(instances) >= 5 else instances,
+                key="itype_cheapest_batch",
+            )
             rows = []
             for it in chosen:
                 r = cheapest_region_for(data, it, platform)
-                if r: rows.append(r)
+                if r:
+                    rows.append(r)
             if rows:
                 df_out = pd.DataFrame(rows).sort_values("AvgPrice")
                 st.dataframe(df_out.style.format({"AvgPrice": "${:.4f}"}), use_container_width=True)
@@ -233,9 +281,7 @@ with tab1:
             else:
                 st.info("Pick one or more instance types to compare.")
 
-# ------------------------------
-# TAB 2 — Trends & Slopes
-# ------------------------------
+# ------------------------------ TAB 2 — Trends & Slopes ------------------------------
 with tab2:
     st.subheader("Daily Price Trends by Region")
     instances2 = sorted([i for i in data["InstanceType"].dropna().unique()])
@@ -271,14 +317,12 @@ with tab2:
             else:
                 st.info("Not enough data per region to fit trends.")
 
-# ------------------------------
-# TAB 3 — Forecast (ML)
-# ------------------------------
+# ------------------------------ TAB 3 — Forecast (ML) ------------------------------
 with tab3:
     st.subheader("7-Day Price Forecast (Linear Regression)")
-
     instances3 = sorted([i for i in data["InstanceType"].dropna().unique()])
     platforms3 = sorted([p for p in data["Platform"].dropna().unique()])
+
     if not instances3 or not platforms3:
         st.info("Data is missing Platform or InstanceType values.")
     else:
@@ -296,7 +340,7 @@ with tab3:
             r = daily_all[daily_all["Region"] == region_fc][["Timestamp", "Price"]]
             out = fit_forecast_linear(r, days_ahead=7)
             if out.empty:
-                st.info("Not enough data to fit the model (need >= 3 days).")
+                st.info("Not enough data to fit the model (need ≥ 3 days).")
             else:
                 fig2 = px.line(out, x="Timestamp", y="Price", color="Type",
                                title=f"{region_fc} • {it_for_fc} on {plat_for_fc} — 7-Day Forecast",
@@ -307,6 +351,7 @@ with tab3:
                 last_fore = out[out["Type"] == "Forecast"]["Price"].iloc[-1]
                 delta = last_fore - last_hist
                 st.metric("Predicted change by day 7", f"{delta:+.4f}")
+
                 st.download_button(
                     "Download forecast CSV",
                     data=out.to_csv(index=False).encode("utf-8"),
@@ -315,4 +360,4 @@ with tab3:
                     key="dl_forecast_csv",
                 )
 
-st.caption("Tip: Filenames should encode the region (e.g., `us-east-1.csv`, `eu-west-1.csv`).")
+st.caption("Tip: Upload multiple CSVs at once or a single .zip with CSVs in the root. Filenames should encode the region (e.g., us-east-1.csv).")
