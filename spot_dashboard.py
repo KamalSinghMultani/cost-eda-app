@@ -2,7 +2,7 @@
 import os
 from pathlib import Path
 from io import BytesIO
-from zipfile import ZipFile
+from zipfile import ZipFile, BadZipFile
 
 import numpy as np
 import pandas as pd
@@ -31,7 +31,6 @@ def _read_csv_flexible(src, *, has_upload_handle: bool) -> pd.DataFrame:
             return df0
         raise ValueError("Header attempt did not match expected columns.")
     except Exception:
-        # Reset uploaded file pointer if needed
         if has_upload_handle and hasattr(src, "seek"):
             try:
                 src.seek(0)
@@ -60,22 +59,31 @@ def load_many_csv_from_folder(folder_path: str) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False)
-def load_many_csv_from_zip(uploaded_zip) -> pd.DataFrame:
-    """Cloud/Upload: read all CSVs inside a .zip; Region from inner file names."""
-    data = uploaded_zip.read()  # bytes
+def load_many_csv_from_zip_bytes(zip_bytes: bytes) -> pd.DataFrame:
+    """
+    Cloud/Upload: read all CSVs inside a .zip from raw bytes; Region from inner filenames.
+    Using bytes avoids Streamlit caching errors with UploadedFile objects.
+    """
     dfs = []
-    with ZipFile(BytesIO(data)) as zf:
-        for info in zf.infolist():
-            if info.is_dir():
-                continue
-            if not info.filename.lower().endswith(".csv"):
-                continue
-            with zf.open(info) as fh:
-                df = _read_csv_flexible(fh, has_upload_handle=True)
-                region = os.path.splitext(os.path.basename(info.filename))[0]
-                df["Region"] = region
-                dfs.append(df)
+    try:
+        with ZipFile(BytesIO(zip_bytes)) as zf:
+            for info in zf.infolist():
+                if info.is_dir():
+                    continue
+                if not info.filename.lower().endswith(".csv"):
+                    continue
+                with zf.open(info) as fh:
+                    df = _read_csv_flexible(fh, has_upload_handle=True)
+                    region = os.path.splitext(os.path.basename(info.filename))[0]
+                    df["Region"] = region
+                    dfs.append(df)
+    except BadZipFile:
+        raise ValueError("The uploaded file is not a valid ZIP.")
+    except Exception as e:
+        raise ValueError(f"Failed to read ZIP: {e}")
+
     if not dfs:
+        # No CSVs found inside the ZIP
         return pd.DataFrame(columns=COLS + ["Region"])
     return pd.concat(dfs, ignore_index=True)
 
@@ -179,7 +187,7 @@ if use_local_folder:
 
 uploads = st.sidebar.file_uploader(
     "Upload regional CSVs (multi-select) or a .zip containing CSVs",
-    type=["csv", "zip"],                 # <-- ZIP enabled
+    type=["csv", "zip"],                 # ZIP enabled
     accept_multiple_files=True,
     key="uploader",
 )
@@ -196,19 +204,24 @@ else:
         dfs = []
         for f in uploads:
             name = f.name.lower()
-            if name.endswith(".zip"):
-                try:
-                    dfs.append(load_many_csv_from_zip(f))
-                except Exception as e:
-                    st.error(f"Failed to read ZIP '{f.name}': {e}")
-            else:  # CSV
-                try:
-                    df = _read_csv_flexible(f, has_upload_handle=True)
+            try:
+                if name.endswith(".zip"):
+                    # IMPORTANT: read bytes OUTSIDE the cached function
+                    zbytes = f.getvalue()  # bytes (hashable)
+                    df_zip = load_many_csv_from_zip_bytes(zbytes)
+                    if df_zip.empty:
+                        st.warning(f"No CSVs found inside ZIP: {f.name}")
+                    else:
+                        dfs.append(df_zip)
+                else:
+                    df_csv = _read_csv_flexible(f, has_upload_handle=True)
                     region = os.path.splitext(os.path.basename(f.name))[0]
-                    df["Region"] = region
-                    dfs.append(df)
-                except Exception as e:
-                    st.error(f"Failed to read CSV '{f.name}': {e}")
+                    df_csv["Region"] = region
+                    dfs.append(df_csv)
+            except ValueError as ve:
+                st.error(f"{f.name}: {ve}")
+            except Exception as e:
+                st.error(f"{f.name}: Failed to read — {e}")
         if dfs:
             raw = pd.concat(dfs, ignore_index=True)
 
